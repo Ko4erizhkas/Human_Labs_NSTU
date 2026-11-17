@@ -15,6 +15,9 @@ namespace {
 // Ограничение на K, заданное вручную
 constexpr int kMaxK = 200;
 
+// Сколько циклов ЛР2 выводить в таблице
+constexpr int kMaxShownCycles = 1000;
+
 // Подписи строк таблицы: prefix1, prefix2, ... Высота 3 — как у ячейки с рамкой
 Element RowLabels(const std::string& prefix, size_t rows) {
     Elements labels;
@@ -85,6 +88,34 @@ float ParseProbability(const std::string& s) {
 // Однострочная кнопка вида [Текст], чтобы строка файла не занимала 3 строки
 Component SmallButton(std::string label, std::function<void()> on_click) {
     return Button(std::move(label), std::move(on_click), ButtonOption::Ascii());
+}
+
+// Прокручиваемая таблица: render рисует строки, помечая строку *row через focus,
+// и yframe держит её на экране. Стрелки и PageUp/PageDown — когда таблица
+// в фокусе, колесо мыши — когда курсор над ней. count — число строк
+Component ScrollTable(std::function<Element(bool)> render, int* row,
+                      std::function<int()> count) {
+    auto box   = std::make_shared<Box>();
+    auto table = Renderer([render, box](bool focused) { return render(focused) | reflect(*box); });
+    return table | CatchEvent([row, count, box](Event event) {
+        int r = *row;
+        if (event.is_mouse()) {
+            if (!box->Contain(event.mouse().x, event.mouse().y)) return false;
+            if (event.mouse().button == Mouse::WheelUp)        r -= 3;
+            else if (event.mouse().button == Mouse::WheelDown) r += 3;
+            else return false;
+        } else if (event == Event::ArrowUp)   r -= 1;
+        else if (event == Event::ArrowDown)   r += 1;
+        else if (event == Event::PageUp)      r -= 10;
+        else if (event == Event::PageDown)    r += 10;
+        else return false;
+
+        r = std::clamp(r, 0, std::max(count() - 1, 0));
+        // На краю таблицы стрелка уходит дальше, к соседним компонентам
+        if (r == *row && !event.is_mouse()) return false;
+        *row = r;
+        return true;
+    });
 }
 
 } // namespace
@@ -193,6 +224,7 @@ Element DataHuman::Stats() const {
         text(std::format("Маршрутов {} (равновероятны)", hist.routes)),
         text(std::format("t_ср     {:.3f}", hist.mean)) | bold | color(Color::Yellow),
         text(std::format("t_ср теор. {:.3f}", hist.mean_theory)),
+        text(std::format("t_sum    {:.3f}", hist.t_sum)) | bold,
         text(std::format("СКО      {:.3f}", hist.sd)),
         text(std::format("Мин      {:.3f}", hist.min)),
         text(std::format("Макс     {:.3f}", hist.max)),
@@ -250,22 +282,26 @@ Element DataHuman::HistogramChart() const {
     });
 }
 
-Element DataHuman::FrequencyTable() const {
-    Elements rows{
-        text(" N      интервал         n       p") | bold,
-        separator(),
-    };
+// Выбранная строка помечается focus, и yframe прокручивает таблицу так,
+// чтобы она была видна — так же прокручиваются таблицы наборов
+Element DataHuman::FrequencyTable(bool focused) const {
+    Elements rows;
     const double n = static_cast<double>(hist.sample.size());
+    const int selected = std::min(freq_row, hist.k - 1);
     for (int i = 0; i < hist.k && !hist.counts.empty(); ++i) {
         const double a = hist.lo + i * hist.width;
-        rows.push_back(text(std::format("{:>2} [{:>8.2f};{:>8.2f}) {:>6} {:.3f}",
-                                        i + 1, a, a + hist.width, hist.counts[i],
-                                        hist.counts[i] / n)));
+        Element row = text(std::format("{:>2} [{:>8.2f};{:>8.2f}) {:>6} {:.3f}",
+                                       i + 1, a, a + hist.width, hist.counts[i],
+                                       hist.counts[i] / n));
+        if (i == selected) row = (focused ? row | inverted : row) | focus;
+        rows.push_back(row);
     }
     return vbox({
         text("Частоты") | bold | hcenter,
         separator(),
-        vbox(std::move(rows)) | yframe | flex,
+        text(" N      интервал         n       p") | bold,
+        separator(),
+        vbox(std::move(rows)) | vscroll_indicator | yframe | flex,
     });
 }
 
@@ -289,9 +325,13 @@ Component DataHuman::HistogramPanel() {
         }
     });
 
-    auto controls = Container::Vertical({set_toggle, n_input, k_input, sigma_input, build});
+    auto freq_table = ScrollTable([this](bool focused) { return FrequencyTable(focused); },
+                                  &freq_row, [this] { return hist.k; });
 
-    return Renderer(controls, [=, this] {
+    auto controls = Container::Vertical({set_toggle, n_input, k_input, sigma_input, build});
+    auto layout   = Container::Horizontal({controls, freq_table});
+
+    return Renderer(layout, [=, this] {
         auto field = [](std::string label, Element input) {
             return hbox({text(std::move(label)) | vcenter | flex, input});
         };
@@ -311,8 +351,114 @@ Component DataHuman::HistogramPanel() {
         return hbox({
             params,
             HistogramChart() | flex | border,
-            FrequencyTable() | border,
+            freq_table->Render() | border,
         });
+    });
+}
+
+Element DataHuman::Lr2Stats() const {
+    if (!lr2.done)
+        return lr2_status.empty() ? text("Нажмите «Рассчитать»") | dim
+                                  : paragraph(lr2_status) | color(Color::Red);
+
+    const double t_model = lr2.sum_fail + lr2.sum_rec;
+    return vbox({
+        text(std::format("Циклов N = {}, режим: {}", lr2.cycles.size(), lr2_mode_names[lr2_mode])),
+        text(std::format("σ/μ норм. шагов = {} (вкладка «Гистограмма»)", sigma_coef)) | dim,
+        separator(),
+        text(std::format("Σ T_отказа   {:.3f}   (теор. N/λ2 = {:.3f})",
+                         lr2.sum_fail, lr2.cycles.size() / lambda_2)),
+        text(std::format("Σ t_пр       {:.3f}   ρ1 · Σ = {:.3f}", lr2.sum_proc, rho_1 * lr2.sum_proc)),
+        text(std::format("Σ τ_вос      {:.3f}   ρ2 · Σ = {:.3f}", lr2.sum_rec, rho_2 * lr2.sum_rec)),
+        text(std::format("T_м = Σ T_отказа + Σ τ_вос = {:.3f}", t_model)),
+        text(std::format("Заявок: пришло {}, обработано {}, аннулировано {}",
+                         lr2.arrived, lr2.processed, lr2.arrived - lr2.processed)),
+        separator(),
+        text(std::format("F = {:.6f}", lr2.F)) | bold | color(Color::Yellow),
+    });
+}
+
+// Циклы по порядку. Выводятся первые kMaxShownCycles: все строки
+// отрисовываются каждый кадр, при большом N интерфейс бы тормозил
+Element DataHuman::Lr2Table(bool focused) const {
+    const int shown    = std::min(static_cast<int>(lr2.cycles.size()), kMaxShownCycles);
+    const int selected = std::min(lr2_row, shown - 1);
+    Elements rows;
+    for (int i = 0; i < shown; ++i) {
+        const Lr2Cycle& c = lr2.cycles[i];
+        Element row = text(std::format("{:>7} {:>11.3f} {:>6} {:>6} {:>6} {:>11.3f} {:>9.3f}",
+                                       i + 1, c.t_fail, c.arrived, c.processed,
+                                       c.arrived - c.processed, c.t_proc, c.t_rec));
+        if (i == selected) row = (focused ? row | inverted : row) | focus;
+        rows.push_back(row);
+    }
+    if (static_cast<int>(lr2.cycles.size()) > shown)
+        rows.push_back(text(std::format("… показаны первые {} из {}", shown, lr2.cycles.size())) | dim);
+    return vbox({
+        text("      №    T_отказа пришло обраб. аннул.      Σ t_пр     τ_вос") | bold,
+        separator(),
+        vbox(std::move(rows)) | vscroll_indicator | yframe | flex,
+    });
+}
+
+Component DataHuman::Lr2Panel() {
+    auto rho_1_input    = NumberCell(&rho_1_buf, [this] { rho_1 = Parse<float>(rho_1_buf); }, "1");
+    auto rho_2_input    = NumberCell(&rho_2_buf, [this] { rho_2 = Parse<float>(rho_2_buf); }, "1");
+    auto lambda_1_input = NumberCell(&lambda_1_buf, [this] { lambda_1 = Parse<float>(lambda_1_buf); }, "0.01");
+    auto lambda_2_input = NumberCell(&lambda_2_buf, [this] { lambda_2 = Parse<float>(lambda_2_buf); }, "0.001");
+    auto n_input        = NumberCell(&lr2_n_buf, [this] { lr2_n = Parse<int>(lr2_n_buf); }, "1000");
+    auto mode           = Radiobox(&lr2_mode_names, &lr2_mode);
+    auto calc = Button("Рассчитать", [this] {
+        try {
+            CalcLr2();
+        } catch (const std::exception& e) {
+            lr2        = Lr2Result{};
+            lr2_status = std::string("Ошибка расчёта: ") + e.what();
+        }
+    });
+    auto table = ScrollTable([this](bool focused) { return Lr2Table(focused); }, &lr2_row, [this] {
+        return std::min(static_cast<int>(lr2.cycles.size()), kMaxShownCycles);
+    });
+
+    auto controls = Container::Vertical({rho_1_input, rho_2_input, lambda_1_input,
+                                         lambda_2_input, n_input, mode, calc});
+    auto layout = Container::Horizontal({controls, table});
+
+    return Renderer(layout, [=, this] {
+        auto field = [](std::string label, Element input) {
+            return hbox({text(std::move(label)) | vcenter | flex, input});
+        };
+        auto f_value = text(lr2.done ? std::format("{:.6f}", lr2.F) : "—")
+                     | color(Color::Yellow) | size(WIDTH, GREATER_THAN, 8) | border;
+        auto params = vbox({
+            text("Параметры") | bold | hcenter,
+            separator(),
+            field("ρ1 регул", rho_1_input->Render()),
+            field("ρ2 восст", rho_2_input->Render()),
+            field("λ1 заявок, 1/с", lambda_1_input->Render()),
+            field("λ2 отказов, 1/с", lambda_2_input->Render()),
+            field("Циклов N", n_input->Render()),
+            separator(),
+            mode->Render(),
+            separator(),
+            calc->Render() | hcenter,
+            field("F", f_value),
+        }) | size(WIDTH, EQUAL, 36) | border;
+
+        auto result = vbox({
+            text("Результат") | bold | hcenter,
+            separator(),
+            text("F = Σ (ρ1 · Σ t_пр + ρ2 · τ_вос) / Σ (T_отказа + τ_вос)") | hcenter,
+            text("T_отказа ~ Exp(λ2);  заявки: t_i = t_{i-1} + Exp(λ1), пока < T_отказа") | dim,
+            text("t_пр — диалог набора 1, τ_вос — диалог набора 2 (модель ЛР1)") | dim,
+            text("при отказе очередь аннулируется, прерванная заявка — до отказа") | dim,
+            separator(),
+            Lr2Stats(),
+            separator(),
+            table->Render() | flex,
+        }) | flex | border;
+
+        return hbox({params, result});
     });
 }
 
@@ -327,7 +473,7 @@ Component DataHuman::RenderAllTables(std::function<void()> on_quit) {
     });
 
     auto page_toggle = Toggle(&page_names, &page);
-    auto pages = Container::Tab({sets_page, HistogramPanel()}, &page);
+    auto pages = Container::Tab({sets_page, HistogramPanel(), Lr2Panel()}, &page);
     auto quit  = Button("Выход", std::move(on_quit));
 
     auto layout = Container::Vertical({page_toggle, pages, quit});

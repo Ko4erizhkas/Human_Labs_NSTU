@@ -49,9 +49,37 @@ struct Histogram
     double lo        = 0;        // Левая граница первого интервала
     double width     = 0;        // Ширина интервала
     double mean = 0, sd = 0, min = 0, max = 0;
+    double t_sum       = 0;      // Суммарное время всех N реализаций
     double mean_theory = 0;      // t_ср, посчитанное аналитически по исходным данным
     size_t routes      = 0;      // Число непустых (равновероятных) маршрутов
 };
+
+// Один цикл ЛР2: работа до отказа, затем восстановление
+struct Lr2Cycle
+{
+    double t_fail    = 0;  // T_отказа ~ Exp(λ2) — работа до отказа
+    int    arrived   = 0;  // Заявок пришло до отказа
+    int    processed = 0;  // Обработано полностью
+    double t_proc    = 0;  // Σ t_пр — время обработки (прерванная заявка — до отказа)
+    double t_rec     = 0;  // τ_вос — диалог набора 2 (Восстановление)
+};
+
+// Результат расчёта ЛР2 по N циклам:
+// F = Σ (ρ1 · Σ t_пр + ρ2 · τ_вос) / Σ (T_отказа + τ_вос)
+struct Lr2Result
+{
+    bool   done      = false;
+    double sum_fail  = 0;  // Σ T_отказа
+    double sum_proc  = 0;  // Σ t_пр
+    double sum_rec   = 0;  // Σ τ_вос
+    long long arrived   = 0;
+    long long processed = 0;
+    double F = 0;
+    std::vector<Lr2Cycle> cycles;
+};
+
+// Маршрут — номера шагов (с 0) по порядку
+using Routes = std::vector<std::vector<size_t>>;
 
 class DataHuman
 {
@@ -68,29 +96,39 @@ public:
     ftxui::Component TableSteps(DataSet& set);
     ftxui::Component SetPanel(DataSet& set, std::string title);
     ftxui::Component HistogramPanel();
+    ftxui::Component Lr2Panel();
     ftxui::Component RenderAllTables(std::function<void()> on_quit);
 
     // K = int(1 + 3.22 lg N)
     static int AutoK(int n);
 
     static constexpr int kMaxSampleN = 10'000'000;
+    // ЛР2: ограничения на число циклов и на число заявок за весь расчёт
+    // (каждая заявка — отдельная реализация диалога набора 1)
+    static constexpr int       kMaxCycles   = 1'000'000;
+    static constexpr long long kMaxRequests = 10'000'000;
 
 private:
     // Моделирование (Simulation.cpp)
     float StepTime(const DataSet& set, size_t step);
     double StepMean(const DataSet& set, size_t step) const;
+    static Routes ParseRoutes(const DataSet& set, std::string& error);
+    float  Realization(const DataSet& set, const Routes& routes);
     void  BuildHistogram();
     void  Rebin();
+    void  CalcLr2();
 
     // Отрисовка результатов (UI.cpp)
     ftxui::Element HistogramChart() const;
-    ftxui::Element FrequencyTable() const;
+    ftxui::Element FrequencyTable(bool focused) const;
     ftxui::Element Stats() const;
+    ftxui::Element Lr2Stats() const;
+    ftxui::Element Lr2Table(bool focused) const;
 
     std::array<DataSet, 2> sets;
 
-    std::vector<std::string> page_names{"Наборы данных", "Гистограмма"};
-    std::vector<std::string> set_names{"Набор 1", "Набор 2"};
+    std::vector<std::string> page_names{"Наборы данных", "Гистограмма", "ЛР2"};
+    std::vector<std::string> set_names{"Набор 1\nРегулирования", "Набор 2\nВосстановления"};
     int page = 0;
 
     // Параметры моделирования
@@ -102,6 +140,25 @@ private:
     std::string k_buf;
     std::string sigma_buf = "0.1";
     std::string status;
+
+    int freq_row = 0;  // Выбранная строка таблицы частот (для прокрутки)
+
+    // Параметры ЛР2
+    std::vector<std::string> lr2_mode_names{"Регул + восст", "Регул", "Восстановления"};
+    int   lr2_mode = 0;       // Индекс в lr2_mode_names: какие слагаемые входят в числитель F
+    float rho_1    = 1.f;     // Вес времени регулирования в F
+    float rho_2    = 1.f;     // Вес времени восстановления в F
+    float lambda_1 = 0.01f;   // Интенсивность потока заявок, 1/с
+    float lambda_2 = 0.001f;  // Интенсивность потока отказов (1/MTBF), 1/с
+    int   lr2_n    = 1000;    // Число циклов N
+    std::string rho_1_buf    = "1";
+    std::string rho_2_buf    = "1";
+    std::string lambda_1_buf = "0.01";
+    std::string lambda_2_buf = "0.001";
+    std::string lr2_n_buf    = "1000";
+    std::string lr2_status;
+    int lr2_row = 0;  // Выбранная строка таблицы циклов (для прокрутки)
+    Lr2Result lr2;
 
     Histogram hist;
     std::mt19937 rng{std::random_device{}()};
